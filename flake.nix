@@ -23,7 +23,6 @@
             atk
             gtk3
             gdk-pixbuf
-            zeromq
             rust-analyzer
             (rust-bin.stable.latest.minimal.override {
               extensions = [
@@ -33,7 +32,7 @@
                 "clippy"
               ];
             })
-            rust-bin.nightly."2021-06-14".rustfmt
+            rust-bin.nightly."2021-10-19".rustfmt
           ];
         };
       }

@@ -2,38 +2,43 @@ use std::{borrow::Cow, ops::Deref, sync::Arc};
 
 use druid::{im, widget::ListIter, Data, Selector};
 use enumflags2::{bitflags, BitFlags};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher as _};
 
-#[bitflags(default = Select)]
+#[bitflags(default = Select | WindowClosed)]
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[rustfmt::skip]
 pub enum Subscription {
-    Select        = 0b001,
-    CursorMove    = 0b010,
-    InputChange  = 0b100,
+    Select        = 0b0001,
+    CursorMove    = 0b0010,
+    InputChange   = 0b0100,
+    WindowClosed  = 0b1000,
 }
 
 #[derive(Debug)]
 pub enum Event {
-    Select(usize),
+    Select(Option<usize>),
     CursorMove(usize),
     InputChange(String),
+    WindowClosed,
 }
 
 impl Event {
+    #[must_use]
     pub fn needed(&self, subscription: BitFlags<Subscription>) -> bool {
         match self {
             Event::Select(_) => subscription.contains(Subscription::Select),
             Event::CursorMove(_) => subscription.contains(Subscription::CursorMove),
             Event::InputChange(_) => subscription.contains(Subscription::InputChange),
+            Event::WindowClosed => subscription.contains(Subscription::WindowClosed),
         }
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Data, serde::Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Data, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum Matcher {
     None,
     Fuzzy,
@@ -45,9 +50,8 @@ impl Default for Matcher {
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Deserialize)]
 pub struct Registration {
-    #[serde(default)]
     pub protocol_version: u8,
     #[serde(default)]
     pub subscribe_to: BitFlags<Subscription>,
@@ -55,14 +59,16 @@ pub struct Registration {
     pub matcher: Matcher,
 }
 
-#[derive(Debug, serde::Serialize)]
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "snake_case", tag = "key", content = "data")]
 pub enum ServerEvent {
     Busy,
     Registered(usize),
     ServerTooOld(u8),
-    Select(usize),
+    Select(Option<usize>),
     CursorMove(usize),
     InputChange(String),
+    WindowClosed,
 }
 
 impl From<Event> for ServerEvent {
@@ -71,6 +77,7 @@ impl From<Event> for ServerEvent {
             Event::Select(n) => ServerEvent::Select(n),
             Event::CursorMove(n) => ServerEvent::CursorMove(n),
             Event::InputChange(input) => ServerEvent::InputChange(input),
+            Event::WindowClosed => ServerEvent::WindowClosed,
         }
     }
 }
@@ -104,7 +111,7 @@ pub struct Choice {
     pub text: ArcStr,
 }
 
-#[derive(Debug, Default, Clone, Data, serde::Deserialize)]
+#[derive(Debug, Default, Clone, Data, Deserialize)]
 pub struct ChoiceSet {
     pub options: im::OrdSet<Choice>,
     #[serde(default)]
@@ -113,11 +120,13 @@ pub struct ChoiceSet {
 
 impl ChoiceSet {
     #[inline]
+    #[must_use]
     pub fn len(&self) -> usize {
         self.options.len()
     }
 
     #[inline]
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.options.is_empty()
     }
@@ -134,7 +143,7 @@ impl ChoiceSet {
                     option
                 })
                 .collect()
-        })
+        });
     }
 }
 
@@ -145,12 +154,10 @@ pub struct Indices {
 }
 
 impl Indices {
+    #[must_use]
     pub fn is_selected(&self) -> bool {
-        if let Some(selected) = self.selected {
-            self.current == selected
-        } else {
-            false
-        }
+        self.selected
+            .map_or(false, |selected| self.current == selected)
     }
 }
 
@@ -167,7 +174,7 @@ impl ListIter<(Indices, Choice)> for ChoiceSet {
                     item.clone(),
                 ),
                 idx,
-            )
+            );
         }
     }
 
@@ -183,7 +190,7 @@ impl ListIter<(Indices, Choice)> for ChoiceSet {
                     item.clone(),
                 ),
                 idx,
-            )
+            );
         }
     }
 
@@ -193,10 +200,12 @@ impl ListIter<(Indices, Choice)> for ChoiceSet {
     }
 }
 
-#[derive(Debug, serde::Deserialize)]
+#[derive(Debug, Deserialize)]
+#[serde(tag = "key", content = "data", rename_all = "snake_case")]
 pub enum ClientRequest {
     Stop,
     SetChoices(ChoiceSet),
+    SetInput(String),
 }
 
 pub const CLIENT_REQUEST_SELECTOR: Selector<ClientRequest> = Selector::new("ClientRequest");

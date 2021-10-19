@@ -11,7 +11,7 @@ use std::{
     thread,
 };
 
-use color_eyre::eyre::{self, bail, eyre};
+use color_eyre::eyre::{self, bail, eyre, WrapErr as _};
 use crossbeam::channel::{self, Receiver, Sender};
 use druid::Target;
 use enumflags2::BitFlags;
@@ -19,10 +19,11 @@ use parking_lot::Mutex;
 use serde::Serialize;
 
 use crate::{
+    socket_traits::{Listener, NetStream},
     types::{
         ClientRequest, Event, Registration, ServerEvent, Subscription, CLIENT_REQUEST_SELECTOR,
     },
-    ui::{self, UiInitialState},
+    ui::self,
 };
 
 pub const PROTOCOL_VERSION: u8 = 0;
@@ -47,10 +48,9 @@ impl Server {
     }
 
     fn send_events<W>(
-        self: Arc<Self>,
-        events: Receiver<Event>,
+        events: &Receiver<Event>,
         subscription: BitFlags<Subscription>,
-        write: Arc<Mutex<W>>,
+        write: &Mutex<W>,
     ) -> eyre::Result<Infallible>
     where
         W: Write + Send,
@@ -69,7 +69,7 @@ impl Server {
         read: R,
         mut write: W,
         client_id: usize,
-        ui_sender: Sender<UiInitialState>,
+        ui_sender: &Sender<ui::InitialState>,
     ) -> eyre::Result<()>
     where
         R: Read,
@@ -89,33 +89,40 @@ impl Server {
             );
         }
 
-        let _guard = match self.busy.try_lock() {
-            Some(guard) => guard,
-            None => {
-                Self::send_message(&mut write, &ServerEvent::Busy)?;
-                self.busy.lock()
-            }
+        let _guard = if let Some(guard) = self.busy.try_lock() {
+            guard
+        } else {
+            Self::send_message(&mut write, &ServerEvent::Busy)?;
+            self.busy.lock()
         };
 
         let (sender, receiver) = channel::unbounded();
         let (control_sender, control_receiver) = channel::bounded(1);
-        ui_sender.send(UiInitialState {
+        ui_sender.send(ui::InitialState {
+            client_id,
             events: sender,
             control: control_sender,
             matcher: registration.matcher,
         })?;
-        // TODO error handling
-        let control = control_receiver.recv().unwrap();
+
+        let control = control_receiver
+            .recv()
+            .wrap_err("failed to receive ExtEventSink from UI thread")?;
         drop(control_receiver);
 
         Self::send_message(&mut write, &ServerEvent::Registered(client_id))?;
 
         let write = Arc::new(Mutex::new(write));
         let events_write = Arc::clone(&write);
-        let this = Arc::clone(&self);
         let _events_thread = thread::spawn(move || {
-            if let Err(_err) = this.send_events(receiver, registration.subscribe_to, events_write) {
-                // TODO logging
+            if let Err(err) =
+                Self::send_events(&receiver, registration.subscribe_to, &*events_write)
+            {
+                tracing::info!(
+                    client_id = client_id,
+                    "client stopped listening for events: {}",
+                    err
+                );
             }
         });
 
@@ -126,7 +133,6 @@ impl Server {
             match req {
                 Ok(req) => {
                     let stop = matches!(req, ClientRequest::Stop);
-                    // TODO error handling
                     control.submit_command(
                         CLIENT_REQUEST_SELECTOR,
                         Box::new(req),
@@ -138,7 +144,11 @@ impl Server {
                     }
                 }
                 Err(err) => {
-                    todo!("error handling: {}", err)
+                    tracing::warn!(
+                        line = line.as_str(),
+                        "failed to parse client request: {}",
+                        err
+                    );
                 }
             }
         }
@@ -158,57 +168,57 @@ impl Server {
         self.last_id.fetch_add(1, Ordering::Relaxed)
     }
 
-    fn start_ui(&self) -> Sender<UiInitialState> {
+    fn start_ui() -> Sender<ui::InitialState> {
         let (sender, receiver) = channel::bounded(1);
-        thread::spawn(move || ui::run_ui(receiver));
+        thread::spawn(move || ui::run(&receiver));
         sender
+    }
+
+    fn run<S: NetStream + Send + 'static, L: Listener<Stream = S>>(
+        self: Arc<Self>,
+        listener: &L,
+    ) -> io::Result<Infallible> {
+        let ui_sender = Self::start_ui();
+        loop {
+            let (stream, _addr) = match listener.accept() {
+                Ok(pair) => pair,
+                Err(err) => {
+                    tracing::error!("failed to accept TCP connection: {}", err);
+                    continue;
+                }
+            };
+
+            let this = Arc::clone(&self);
+            let ui_sender = ui_sender.clone();
+            thread::spawn(move || {
+                let client_id = this.next_id();
+                let _span = tracing::info_span!("client-thread", client_id = client_id);
+
+                let cloned_stream = match stream.try_clone() {
+                    Ok(cloned) => cloned,
+                    Err(err) => {
+                        tracing::error!("failed to clone stream: {}", err);
+                        return;
+                    }
+                };
+                if let Err(err) = this.serve_client(stream, cloned_stream, client_id, &ui_sender) {
+                    tracing::error!("error while serving client: {}", err);
+                }
+            });
+        }
     }
 
     pub fn run_tcp<A>(addr: A) -> io::Result<Infallible>
     where
         A: ToSocketAddrs,
     {
-        let this = Self::new();
-        let listener = TcpListener::bind(addr)?;
-        let ui_sender = this.start_ui();
-        loop {
-            // TODO: probably tracing + continue to accept
-            let (stream, _addr) = listener.accept()?;
-            let this = this.clone();
-            let ui_sender = ui_sender.clone();
-            thread::spawn(move || {
-                // TODO: proper error handling
-                let cloned_stream = stream.try_clone().unwrap();
-                let client_id = this.next_id();
-                if let Err(err) = this.serve_client(stream, cloned_stream, client_id, ui_sender) {
-                    // TODO: proper error handling
-                    panic!("err in serve_client: {}", err);
-                }
-            });
-        }
+        Self::new().run(&TcpListener::bind(addr)?)
     }
 
     pub fn run_unix<A>(addr: A) -> io::Result<Infallible>
     where
         A: AsRef<Path>,
     {
-        let this = Self::new();
-        let listener = UnixListener::bind(addr)?;
-        let ui_sender = this.start_ui();
-        loop {
-            // TODO: probably tracing + continue to accept
-            let (stream, _addr) = listener.accept()?;
-            let this = this.clone();
-            let ui_sender = ui_sender.clone();
-            thread::spawn(move || {
-                // TODO: proper error handling
-                let cloned_stream = stream.try_clone().unwrap();
-                let client_id = this.next_id();
-                if let Err(err) = this.serve_client(stream, cloned_stream, client_id, ui_sender) {
-                    // TODO: proper error handling
-                    panic!("err in serve_client: {}", err);
-                }
-            });
-        }
+        Self::new().run(&UnixListener::bind(addr)?)
     }
 }
